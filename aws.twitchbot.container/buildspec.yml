@@ -1,0 +1,18 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - export DLLVERSION=$(date +1.0.%y%j.%H%M)
+      - sed -i 's#\\#/#g' AWS.TwitchBot.Container.sln
+      - dotnet restore AWS.TwitchBot.Container.sln -s https://api.nuget.org/v3/index.json
+  build:
+    commands:
+      - $(aws ecr get-login --no-include-email --region us-east-1)
+      - dotnet publish -c Debug --self-contained -r linux-x64 -o "container" --source https://api.nuget.org/v3/index.json /p:Version=$DLLVERSION 
+      - docker build -t aws.twitchbot.container .
+      - docker tag aws.twitchbot.container:latest 246716306459.dkr.ecr.us-east-1.amazonaws.com/aws.twitch.container:latest
+      - docker push 246716306459.dkr.ecr.us-east-1.amazonaws.com/aws.twitch.container:latest
+  post_build:
+    commands:
+ 

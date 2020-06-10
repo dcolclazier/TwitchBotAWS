@@ -1,0 +1,443 @@
+--- 
+AWSTemplateFormatVersion: "2010-09-09"
+Description: ""
+Parameters: 
+  CodeBucket: 
+    Default: dcolclaz-twitch-codebuild
+    Description: "Where's the code?"
+    MaxLength: "256"
+    MinLength: "0"
+    Type: String
+  EC2KeyName: 
+    ConstraintDescription: "Can only contain ASCII characters!"
+    Default: ECSKeyPairDocker
+    Description: "Not in use. Would be the EC2 KeyPair to enable SSH access to this instance"
+    Type: "AWS::EC2::KeyPair::KeyName"
+  ECSScalingCooldown: 
+    Default: 120
+    Description: "The amount of time (in seconds) after a scaling activity completes before another scaling activity can start."
+    MaxValue: 300
+    MinValue: 60
+    Type: Number
+  LoggingLevel: 
+    Default: 0
+    Description: "Default logging level for environment (0 = most logging. 4 = error only, 6 = none)"
+    MaxValue: 6
+    MinValue: 0
+    Type: Number
+  MaximumInstanceCount: 
+    Default: 1
+    Description: "Maximum ec2 instances for this cluster"
+    MaxValue: 4
+    MinValue: 1
+    Type: Number
+  MinimumInstanceCount: 
+    Default: 1
+    Description: "Minimum ec2 instances for this cluster"
+    MaxValue: 4
+    MinValue: 1
+    Type: Number
+  TargetBacklogPerInstance: 
+    Default: 3
+    Description: "Equal to (acceptable latency)/(avg EC2 process time)"
+    MaxValue: 10
+    MinValue: 1
+    Type: Number
+Resources: 
+  AutoScalingLaunchConfig: 
+    Properties: 
+      IamInstanceProfile: !Ref EC2IAMInstanceProfile
+      ImageId: ami-0b22c910bce7178b6
+      InstanceType: t2.small
+      KeyName: !Ref EC2KeyName
+      SecurityGroups: 
+        - !Ref ECSSecurityGroup
+      UserData: 
+        ? "Fn::Base64"
+        : |
+            #!/bin/bash -xe
+            echo ECS_CLUSTER=TwitchBot >> /etc/ecs/ecs.config
+            rpm -Uvh https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.amzn1.noarch.rpm
+            yum install -y aws-cfn-bootstrap
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource ECSAutoScalingGroup --region ${AWS::Region}
+    Type: "AWS::AutoScaling::LaunchConfiguration"
+  EC2IAMInstanceProfile: 
+    Properties: 
+      Path: /
+      Roles: 
+        - !Ref LambdaRole
+    Type: "AWS::IAM::InstanceProfile"
+  ECSAutoScalingGroup: 
+    CreationPolicy: 
+      ResourceSignal: 
+        Count: 1
+        Timeout: PT20M
+    Properties: 
+      Cooldown: !Ref ECSScalingCooldown
+      LaunchConfigurationName: !Ref AutoScalingLaunchConfig
+      MaxSize: !Ref MaximumInstanceCount
+      MinSize: !Ref MinimumInstanceCount
+      VPCZoneIdentifier: 
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+  ECSCluster: 
+    Properties: 
+      ClusterName: TwitchBot
+    Type: "AWS::ECS::Cluster"
+  ECSInstanceScalingPolicy: 
+    Properties: 
+      AutoScalingGroupName: !Ref ECSAutoScalingGroup
+      PolicyType: TargetTrackingPolicy
+      TargetTrackingConfiguration: 
+        CustomizedMetricSpecification: 
+          MetricName: ECSBacklogPerInstance
+          Namespace: AWS.TwitchBot
+          Statistic: Average
+          Unit: None
+        TargetValue: !Ref TargetBacklogPerInstance
+    Type: "AWS::AutoScaling::ScalingPolicy"
+  ECSSecurityGroup: 
+    DependsOn: 
+      - VPC
+    Properties: 
+      GroupDescription: "ECS Security Group"
+      SecurityGroupEgress: 
+        CidrIp: 0.0.0.0/0
+        FromPort: -1
+        IpProtocol: -1
+        ToPort: -1
+      SecurityGroupIngress: 
+        CidrIp: 0.0.0.0/0
+        FromPort: 22
+        IpProtocol: tcp
+        ToPort: 22
+      VpcId: !Ref VPC
+    Type: "AWS::EC2::SecurityGroup"
+  ECSService: 
+    Properties: 
+      Cluster: !Ref ECSCluster
+      DesiredCount: 1
+      NetworkConfiguration: 
+        AwsvpcConfiguration: 
+          AssignPublicIp: DISABLED
+          SecurityGroups: 
+            - !Ref ECSSecurityGroup
+          Subnets: 
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+      ServiceName: AWS-TwitchBot
+      TaskDefinition: !Ref TaskDefinition
+    Type: "AWS::ECS::Service"
+  ECSTaskScalingPolicy: 
+    Properties: 
+      PolicyName: ECSTaskScalingPolicy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref SQSTaskScalableTarget
+      TargetTrackingScalingPolicyConfiguration: 
+        CustomizedMetricSpecification: 
+          MetricName: ECSBacklogPerTask
+          Namespace: AWS.TwitchBot
+          Statistic: Average
+          Unit: None
+        TargetValue: 2
+    Type: "AWS::ApplicationAutoScaling::ScalingPolicy"
+  GatewayToInternet: 
+    Properties: 
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+    Type: "AWS::EC2::VPCGatewayAttachment"
+  InternetGateway: 
+    Properties: 
+      Tags: 
+        - Key: Name
+          Value: TwitchBotInternetGateway
+        - Key: Network
+          Value: Public
+    Type: "AWS::EC2::InternetGateway"
+  LambdaRole: 
+    Metadata: 
+      Comment: "Access role for Lambdas"
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Statement: 
+          Action: "sts:AssumeRole"
+          Effect: Allow
+          Principal: 
+            Service: 
+              - lambda.amazonaws.com
+              - ec2.amazonaws.com
+              - ecs-tasks.amazonaws.com
+              - sqs.amazonaws.com
+        Version: "2012-10-17"
+      Policies: 
+        - PolicyDocument: 
+            Statement: 
+              - Action: "logs:*"
+                Effect: Allow
+                Resource: "*"
+              - Action: "sqs:*"
+                Effect: Allow
+                Resource: "*"
+              - Action: "lambda:*"
+                Effect: Allow
+                Resource: "*"
+              - Action: "ecs:*"
+                Effect: Allow
+                Resource: "*"
+              - Action: "sns:*"
+                Effect: Allow
+                Resource: "*"
+              - Action: "s3:*"
+                Effect: Allow
+                Resource: "*"
+              - Action: "autoscaling:*"
+                Effect: Allow
+                Resource: "*"
+              - Action: "cloudwatch:*"
+                Effect: Allow
+                Resource: "*"
+              - Action: "dynamodb:*"
+                Effect: Allow
+                Resource: "*"
+              - Action: "translate:*"
+                Effect: Allow
+                Resource: "*"
+              - Action: "comprehend:*"
+                Effect: Allow
+                Resource: "*"
+              - Action: 
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                Effect: Allow
+                Resource: "*"
+            Version: "2012-10-17"
+          PolicyName: LambdaPolicy
+    Type: "AWS::IAM::Role"
+  NatGateway: 
+    DependsOn: NatPublicIP
+    Properties: 
+      AllocationId: !GetAtt NatPublicIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+    Type: "AWS::EC2::NatGateway"
+  NatPublicIP: 
+    DependsOn: VPC
+    Properties: 
+      Domain: vpc
+    Type: "AWS::EC2::EIP"
+  OneMinuteMetricsEvent: 
+    Properties: 
+      Description: "AWS.TwitchBot Scaling CW Event (1 minute)"
+      ScheduleExpression: "rate(1 minute)"
+      State: ENABLED
+      Targets: 
+        - Arn: !GetAtt OneMinuteMetricsLambda.Arn
+          Id: TargetFunctionV1
+    Type: "AWS::Events::Rule"
+  OneMinuteMetricsInvokePermission: 
+    Properties: 
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref OneMinuteMetricsLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OneMinuteMetricsEvent.Arn
+    Type: "AWS::Lambda::Permission"
+  OneMinuteMetricsLambda: 
+    Metadata: 
+      Comment: "Lambda that posts custom cloudwatch metric(s) for aws.twitchbot"
+    Properties: 
+      Code: 
+        S3Bucket: !Ref CodeBucket
+        S3Key: TwitchBot.AWS.zip
+      Environment: 
+        Variables: 
+          LOGGING_LEVEL: !Ref LoggingLevel
+      FunctionName: OneMinuteMetricsLambda
+      Handler: "AWS.TwitchBot.AWS::AWS.TwitchBot.AWS.Core.Lambda.CloudWatch.OneMinuteMetricReporter::OnAPIRequest"
+      MemorySize: 128
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: dotnetcore2.1
+      Timeout: 30
+      TracingConfig: 
+        Mode: Active
+    Type: "AWS::Lambda::Function"
+  PrivateRoute: 
+    DependsOn: PrivateRouteTable
+    Properties: 
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+      RouteTableId: !Ref PrivateRouteTable
+    Type: "AWS::EC2::RouteTable"
+  PrivateRouteTable: 
+    Type: "AWS::EC2::RouteTable"
+    Properties: 
+      Tags: 
+        - Key: Network
+          Value: Private
+      VpcId: !Ref VPC
+  PrivateSubnet1: 
+    Type: "AWS::EC2::Subnet"
+    Properties: 
+      AvailabilityZone: us-east-1a
+      CidrBlock: 10.1.1.0/24
+      MapPublicIpOnLaunch: false
+      VpcId: !Ref VPC
+  PrivateSubnet1RouteTableAssociation: 
+    DependsOn:
+        - PrivateRouteTable
+        - PrivateSubnet1
+    Properties: 
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+    Type: AWS::EC2::SubnetRouteTableAssociation
+  PrivateSubnet2: 
+    Properties: 
+      AvailabilityZone: us-east-1b
+      CidrBlock: 10.1.2.0/24
+      MapPublicIpOnLaunch: false
+      VpcId: !Ref VPC
+    Type: AWS::EC2::Subnet
+  PrivateSubnet2RouteTableAssociation: 
+    DependsOn:
+        - PrivateRouteTable
+        - PrivateSubnet2
+    Properties: 
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+    Type: AWS::EC2::SubnetRouteTableAssociation
+  PublicRoute: 
+    DependsOn: GatewayToInternet
+    Properties: 
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+      RouteTableId: !Ref PublicRouteTable
+    Type: "AWS::EC2::RouteTable"
+  PublicRouteTable: 
+    Properties: 
+      Tags: 
+        - Key: Network
+          Value: Public
+      VpcId: !Ref VPC
+    Type: "AWS::EC2::RouteTable"
+  PublicSubnet1: 
+    Properties: 
+      AvailabilityZone: us-east-1a
+      CidrBlock: 10.1.3.0/24
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+    Type: "AWS::EC2::Subnet"
+  PublicSubnet2: 
+    Properties: 
+      AvailabilityZone: us-east-1b
+      CidrBlock: 10.1.4.0/24
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+    Type: "AWS::EC2::Subnet"  
+  PublicSubnet1RouteTableAssociation:
+    DependsOn:
+        - PublicRouteTable
+        - PublicSubnet1
+    Properties: 
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+  PublicSubnet2RouteTableAssociation: 
+    DependsOn:
+        - PublicRouteTable
+        - PublicSubnet2
+    Properties: 
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+  RequestQueue: 
+    Metadata: 
+      Comment: "Queue that receives all messages that need to be processed"
+    Properties: 
+      QueueName: RequestQueue
+    Type: "AWS::SQS::Queue"
+  RequestSQSLambdaMapping: 
+    DependsOn: 
+      - RequestQueue
+      - SQSRequestLambda
+    Properties: 
+      BatchSize: 10
+      EventSourceArn: !GetAtt RequestQueue.Arn
+      FunctionName: !Ref SQSRequestLambda
+    Type: "AWS::Lambda::EventSourceMapping"
+  ResponseQueue: 
+    Metadata: 
+      Comment: "Queue that receives all messages that need to be sent back to the user"
+    Properties: 
+      QueueName: ResponseQueue
+    Type: "AWS::SQS::Queue"
+  ResponseSQSLambdaMapping: 
+    DependsOn: 
+      - ResponseQueue
+      - SQSResponseLambda
+    Properties: 
+      BatchSize: 10
+      EventSourceArn: !GetAtt ResponseQueue.Arn
+      FunctionName: !Ref SQSResponseLambda
+    Type: "AWS::Lambda::EventSourceMapping"
+  SQSRequestLambda: 
+    Metadata: 
+      Comment: "Message lambda - processes chat messages, adds to request queue."
+    Properties: 
+      Code: 
+        S3Bucket: !Ref CodeBucket
+        S3Key: TwitchBot.AWS.zip
+      FunctionName: SQSRequestLambda
+      Handler: "AWS.TwitchBot.AWS::AWS.TwitchBot.AWS.Core.Lambda.SQSRequestLambda::RunAsync"
+      MemorySize: 128
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: dotnetcore3.1
+      TracingConfig: 
+        Mode: Active
+    Type: "AWS::Lambda::Function"
+  SQSResponseLambda: 
+    Metadata: 
+      Comment: "Message lambda - processes response messages, sends to twitch user."
+    Properties: 
+      Code: 
+        S3Bucket: !Ref CodeBucket
+        S3Key: TwitchBot.AWS.zip
+      FunctionName: SQSResponseLambda
+      Handler: "AWS.TwitchBot.AWS::AWS.TwitchBot.AWS.Core.Lambda.SQSResponseLambda::RunAsync"
+      MemorySize: 128
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: dotnetcore3.1
+      TracingConfig: 
+        Mode: Active
+    Type: "AWS::Lambda::Function"
+  SQSTaskScalableTarget: 
+    DependsOn: 
+      - ECSService
+      - ECSCluster
+    Properties: 
+      MaxCapacity: 2
+      MinCapacity: 1
+      ResourceId: service/TwitchBot/AWS.TwitchBot
+      RoleArn: !GetAtt LambdaRole.Arn
+      ScalableDimension: "ecs:service:DesiredCount"
+      ServiceNameSpace: ecs
+    Type: "AWS::ApplicationAutoScaling::ScalableTarget"
+  TaskDefinition: 
+    Properties: 
+      ContainerDefinitions: 
+        - Cpu: 1024
+          Essential: true
+          Image: "246716306459.dkr.ecr.us-east-1.amazonaws.com/aws.twitch.container:latest"
+          Memory: 2048
+          Name: !Ref "AWS::StackName"
+      Cpu: 1024
+      ExecutionRoleArn: !GetAtt LambdaRole.Arn
+      Family: !Ref "AWS::StackName"
+      Memory: 2048
+      NetworkMode: awsvpc
+      RequiresCompatibilities: 
+        - EC2
+      TaskRoleArn: !GetAtt LambdaRole.Arn
+    Type: "AWS::ECS::TaskDefinition"
+  VPC: 
+    Properties: 
+      CidrBlock: 10.1.0.0/16
+    Type: "AWS::EC2::VPC"

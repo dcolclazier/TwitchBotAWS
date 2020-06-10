@@ -1,0 +1,20 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - export DLLVERSION=$(date +1.0.%y%j.%H%M)
+      - sed -i 's#\\#/#g' AWS.TwitchBot.AWS.sln
+      - dotnet restore AWS.TwitchBot.AWS.sln -s https://api.nuget.org/v3/index.json
+  build:
+    commands:
+      - dotnet publish -c Debug --source https://api.nuget.org/v3/index.json /p:Version=$DLLVERSION 
+  post_build:
+    commands:
+artifacts:
+  files:
+    - "msbuild.log"
+    - "bin/*.dll"
+    - "bin/*.json"
+    - "serverless.yml"
+  discard-paths: yes  
